@@ -528,8 +528,9 @@ class IntegrityMismatchError extends Error {
  * @param {string} handle The users handle, passed to getBackupFunction.
  * @param {string} cardName Passed to backupChat.
  * @param {string} backupDirectory Passed to backupChat.
+ * @param {() => void} [beforeWrite] Optional synchronous conflict check immediately before writing.
  */
-export async function trySaveChat(chatData, filePath, skipIntegrityCheck = false, handle, cardName, backupDirectory) {
+export async function trySaveChat(chatData, filePath, skipIntegrityCheck = false, handle, cardName, backupDirectory, beforeWrite) {
     const jsonlData = chatData?.map(m => JSON.stringify(m)).join('\n');
 
     const doIntegrityCheck = (checkIntegrity && !skipIntegrityCheck);
@@ -538,6 +539,7 @@ export async function trySaveChat(chatData, filePath, skipIntegrityCheck = false
     if (chatIntegritySlug && !await checkChatIntegrity(filePath, chatIntegritySlug)) {
         throw new IntegrityMismatchError(`Chat integrity check failed for "${filePath}". The expected integrity slug was "${chatIntegritySlug}".`);
     }
+    beforeWrite?.();
     tryWriteFileSync(filePath, jsonlData);
     getBackupFunction(handle, cardName)(backupDirectory, cardName, jsonlData);
 }
