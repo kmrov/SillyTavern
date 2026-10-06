@@ -99,6 +99,17 @@ test('the next turn includes the saved conversation and keeps lore inactive when
     ]);
 });
 
+test('a pre-created empty Studio conversation includes the card greeting', async () => {
+    saveSettings();
+    const chatFile = path.join(directories.chats, 'Mira', 'studio-empty.jsonl');
+    fs.writeFileSync(chatFile, JSON.stringify({ chat_metadata: { livetalking_studio: true }, user_name: 'Visitor', character_name: 'Mira' }));
+    modelRequests.length = 0;
+    await send({ character_id: 'Mira', chat_id: 'studio-empty', message: 'Hello' });
+    assert.deepEqual(modelRequests[0].messages.at(-2), { role: 'assistant', content: 'Welcome to the library.' });
+    const saved = fs.readFileSync(chatFile, 'utf8').split('\n').map(JSON.parse);
+    assert.equal(saved[1].mes, 'Welcome to the library.');
+});
+
 test('lorebook entries at chat depth are inserted near the latest message', async () => {
     modelRequests.length = 0;
     await send({ avatar_url: 'Mira.png', chat_id: 'depth-test', message: 'Show me the atlas.' });
@@ -297,4 +308,149 @@ test('OpenAI reasoning models receive their compatible token and sampling fields
     assert.equal('max_tokens' in body, false);
     assert.equal('temperature' in body, false);
     assert.equal('top_p' in body, false);
+});
+
+test('streamed character reply yields chunks and saves one completed turn with request_id', async () => {
+    saveSettings();
+    const received = [];
+    for await (const part of chatService.streamCharacterMessage({
+        directories, handle: 'test', characterId: 'Mira', chatId: 'stream-test', message: 'Hello', requestId: 'studio-1',
+        generateStream: async function* () {
+            yield 'Hello';
+            assert.equal(fs.existsSync(path.join(directories.chats, 'Mira', 'stream-test.jsonl')), false);
+            yield ' back';
+        },
+    })) received.push(part);
+    assert.deepEqual(received, ['Hello', ' back']);
+    const saved = fs.readFileSync(path.join(directories.chats, 'Mira', 'stream-test.jsonl'), 'utf8').split('\n').map(JSON.parse);
+    assert.equal(saved.at(-2).extra.studio_request_id, 'studio-1');
+    assert.equal(saved.at(-1).mes, 'Hello back');
+    let regenerated = false;
+    const replay = [];
+    for await (const part of chatService.streamCharacterMessage({
+        directories, handle: 'test', characterId: 'Mira', chatId: 'stream-test', message: 'Hello', requestId: 'studio-1',
+        generateStream: async function* () { regenerated = true; yield 'Wrong'; },
+    })) replay.push(part);
+    assert.deepEqual(replay, ['Hello back']);
+    assert.equal(regenerated, false);
+});
+
+test('stream failure keeps the chat unchanged', async () => {
+    const chatFile = path.join(directories.chats, 'Mira', 'stream-test.jsonl');
+    const beforeFailure = fs.readFileSync(chatFile, 'utf8');
+    const received = [];
+    await assert.rejects(async () => {
+        for await (const part of chatService.streamCharacterMessage({
+            directories, handle: 'test', characterId: 'Mira', chatId: 'stream-test', message: 'Failed turn', requestId: 'studio-2',
+            generateStream: async function* () { yield 'Partial'; throw new Error('Upstream failed'); },
+        })) received.push(part);
+    }, /Upstream failed/);
+    assert.deepEqual(received, ['Partial']);
+    assert.equal(fs.readFileSync(chatFile, 'utf8'), beforeFailure);
+});
+
+test('the first streamed chunk arrives before the model finishes its reply', async () => {
+    saveSettings();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const iterator = chatService.streamCharacterMessage({
+        directories, handle: 'test', characterId: 'Mira', chatId: 'timing-test', message: 'Hello',
+        generateStream: async function* () { yield 'Early'; await gate; yield ' ending'; },
+    })[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.deepEqual(first, { value: 'Early', done: false });
+    assert.equal(fs.existsSync(path.join(directories.chats, 'Mira', 'timing-test.jsonl')), false);
+    release();
+    assert.deepEqual(await iterator.next(), { value: ' ending', done: false });
+    assert.equal((await iterator.next()).done, true);
+});
+
+test('stored Custom headers resolve an allowed environment key without saving its value', async () => {
+    saveSettings();
+    const settings = JSON.parse(fs.readFileSync(path.join(directories.root, 'settings.json'), 'utf8'));
+    settings.oai_settings.custom_include_headers = 'Authorization: "Api-Key ${ENV:SILLYTAVERN_CUSTOM_API_KEY}"';
+    process.env.SILLYTAVERN_CUSTOM_API_KEY = 'test-secret';
+    try {
+        let header;
+        await chatService.generateWithStoredSettings({ settings, directories, messages: [{ role: 'user', content: 'Hello' }] },
+            async (_url, options) => {
+                header = options.headers.Authorization;
+                return { ok: true, json: async () => ({ choices: [{ message: { content: 'Hi' } }] }) };
+            });
+        assert.equal(header, 'Api-Key test-secret');
+        assert.equal(settings.oai_settings.custom_include_headers.includes('test-secret'), false);
+    } finally {
+        delete process.env.SILLYTAVERN_CUSTOM_API_KEY;
+    }
+});
+
+test('a lowercase Custom authorization header replaces the default Bearer header', async () => {
+    saveSettings();
+    const settings = JSON.parse(fs.readFileSync(path.join(directories.root, 'settings.json'), 'utf8'));
+    settings.oai_settings.custom_include_headers = 'authorization: "Api-Key ${ENV:SILLYTAVERN_CUSTOM_API_KEY}"';
+    process.env.SILLYTAVERN_CUSTOM_API_KEY = 'test-secret';
+    try {
+        let headers;
+        await chatService.generateWithStoredSettings({ settings, directories, messages: [{ role: 'user', content: 'Hello' }] },
+            async (_url, options) => {
+                headers = options.headers;
+                return { ok: true, json: async () => ({ choices: [{ message: { content: 'Hi' } }] }) };
+            });
+        assert.deepEqual(Object.entries(headers).filter(([name]) => name.toLowerCase() === 'authorization'),
+            [['authorization', 'Api-Key test-secret']]);
+    } finally {
+        delete process.env.SILLYTAVERN_CUSTOM_API_KEY;
+    }
+});
+
+test('Custom header placeholders can use the stored secret and reject unrelated environment keys', async () => {
+    const { resolveCustomSecretHeaders } = await import('../src/custom-secret-headers.js');
+    assert.deepEqual(resolveCustomSecretHeaders({ Authorization: 'Api-Key ${SECRET:CUSTOM}' }, 'stored-key'), { Authorization: 'Api-Key stored-key' });
+    assert.throws(() => resolveCustomSecretHeaders({ Authorization: 'Api-Key ${ENV:HOME}' }, ''), /not allowed/);
+    assert.throws(() => resolveCustomSecretHeaders({ Authorization: 'Api-Key ${ENV:SILLYTAVERN_CUSTOM_API_KEY}' }, '', {}), /not set/);
+});
+
+test('upstream SSE yields deltas before completion and rejects an incomplete stream', async () => {
+    saveSettings();
+    const settings = JSON.parse(fs.readFileSync(path.join(directories.root, 'settings.json'), 'utf8'));
+    settings.oai_settings.custom_include_body = 'stream: false';
+    settings.oai_settings.custom_exclude_body = 'stream: true';
+    const received = [];
+    let sentBody;
+    const response = new Response(new ReadableStream({
+        start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Hel"}}]}\r\n\r\n'));
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"lo"}}]}\n\ndata: [DONE]\n\n'));
+            controller.close();
+        },
+    }));
+    const result = await chatService.generateWithStoredSettings({
+        settings, directories, messages: [{ role: 'user', content: 'Hello' }], onChunk: delta => received.push(delta),
+    }, async (_url, options) => { sentBody = JSON.parse(options.body); return response; });
+    assert.deepEqual(received, ['Hel', 'lo']);
+    assert.equal(result, 'Hello');
+    assert.equal(sentBody.stream, true);
+    await assert.rejects(chatService.generateWithStoredSettings({
+        settings, directories, messages: [{ role: 'user', content: 'Hello' }], onChunk: () => {},
+    }, async () => new Response('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n')), error => error.status === 502);
+});
+
+test('the HTTP streaming handler emits a completed answer after its turn is saved', async () => {
+    saveSettings();
+    const { handleCharacterChat } = await import('../src/endpoints/character-chat.js');
+    const chunks = [];
+    const response = {
+        destroyed: false,
+        writeHead(code, headers) { this.statusCode = code; this.headers = headers; },
+        write(chunk) { chunks.push(chunk); },
+        end() { this.ended = true; },
+    };
+    await handleCharacterChat({ user: { directories, profile: { handle: 'test' } }, body: {
+        character_id: 'Mira', chat_id: 'stream-test', message: 'Hello', request_id: 'studio-1', stream: true,
+    } }, response);
+    assert.equal(response.statusCode, 200);
+    assert.match(response.headers['Content-Type'], /text\/event-stream/);
+    assert.match(chunks.join(''), /event: delta/);
+    assert.match(chunks.join(''), /event: done/);
+    assert.equal(response.ended, true);
 });

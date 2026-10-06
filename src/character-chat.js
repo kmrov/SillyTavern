@@ -5,6 +5,7 @@ import sanitize from 'sanitize-filename';
 import tiktoken from 'tiktoken';
 
 import { SETTINGS_FILE } from './constants.js';
+import { resolveCustomSecretHeaders } from './custom-secret-headers.js';
 import { trySaveChat } from './endpoints/chats.js';
 import { processCharacter } from './endpoints/characters.js';
 import { readWorldInfoFile } from './endpoints/worldinfo.js';
@@ -179,7 +180,7 @@ function buildMessages({ character, chatData, message, settings, directories }) 
 }
 
 /** Send through the selected OpenAI-compatible Chat Completion source. */
-export async function generateWithStoredSettings({ messages, settings, directories }, fetchImpl = fetch) {
+export async function generateWithStoredSettings({ messages, settings, directories, onChunk }, fetchImpl = fetch) {
     const options = settings.oai_settings;
     const source = options.chat_completion_source;
     const providers = {
@@ -204,7 +205,7 @@ export async function generateWithStoredSettings({ messages, settings, directori
     if (!apiKey && source !== 'custom') throw new CharacterChatError(422, `API key for ${source} is not configured.`);
     const requestHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey || ''}` };
     const requestBody = {
-        model: provider.model, messages, stream: false,
+        model: provider.model, messages, stream: Boolean(onChunk),
         temperature: Number(options.temp_openai ?? 1),
         max_tokens: Number(options.openai_max_tokens ?? 300),
         top_p: Number(options.top_p_openai ?? 1),
@@ -244,10 +245,23 @@ export async function generateWithStoredSettings({ messages, settings, directori
         }
     }
     if (source === 'custom') {
-        mergeObjectWithYaml(requestHeaders, options.custom_include_headers);
+        const customHeaders = {};
+        mergeObjectWithYaml(customHeaders, options.custom_include_headers);
+        for (const name of Object.keys(customHeaders)) {
+            for (const existing of Object.keys(requestHeaders)) {
+                if (name.toLowerCase() === existing.toLowerCase()) delete requestHeaders[existing];
+            }
+        }
+        Object.assign(requestHeaders, customHeaders);
+        try {
+            resolveCustomSecretHeaders(requestHeaders, apiKey);
+        } catch (error) {
+            throw new CharacterChatError(422, error.message);
+        }
         mergeObjectWithYaml(requestBody, options.custom_include_body);
         excludeKeysByYaml(requestBody, options.custom_exclude_body);
     }
+    requestBody.stream = Boolean(onChunk);
     let response;
     try {
         response = await fetchImpl(url, {
@@ -260,6 +274,34 @@ export async function generateWithStoredSettings({ messages, settings, directori
         throw new CharacterChatError(502, `Chat Completion request failed: ${error.message}`);
     }
     if (!response.ok) throw new CharacterChatError(502, `Chat Completion source returned HTTP ${response.status}.`);
+    if (onChunk) {
+        let pending = '';
+        let answer = '';
+        let finished = false;
+        const decoder = new TextDecoder();
+        for await (const bytes of response.body) {
+            pending = (pending + decoder.decode(bytes, { stream: true })).replace(/\r\n/g, '\n');
+            let boundary;
+            while ((boundary = pending.indexOf('\n\n')) >= 0) {
+                const block = pending.slice(0, boundary);
+                pending = pending.slice(boundary + 2);
+                const data = block.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+                if (!data) continue;
+                if (data === '[DONE]') { finished = true; break; }
+                let payload;
+                try { payload = JSON.parse(data); } catch { throw new CharacterChatError(502, 'Chat Completion source returned invalid streaming JSON.'); }
+                if (payload.error) throw new CharacterChatError(502, 'Chat Completion source reported a streaming error.');
+                const delta = payload.choices?.[0]?.delta?.content;
+                if (typeof delta === 'string' && delta) {
+                    answer += delta;
+                    await onChunk(delta);
+                }
+            }
+            if (finished) break;
+        }
+        if (!finished || !answer.trim()) throw new CharacterChatError(502, 'Chat Completion source ended without a complete assistant reply.');
+        return answer;
+    }
     const result = await response.json();
     const content = result?.choices?.[0]?.message?.content;
     const reply = typeof content === 'string' ? content : Array.isArray(content)
@@ -283,7 +325,7 @@ async function withChatLock(key, work) {
 }
 
 /** Generate and persist one turn using the user's stored character, lore and model settings. */
-export async function sendCharacterMessage({ directories, handle, characterId, avatarUrl, chatId = DEFAULT_CHAT_ID, message, generate = generateWithStoredSettings }) {
+export async function sendCharacterMessage({ directories, handle, characterId, avatarUrl, chatId = DEFAULT_CHAT_ID, message, requestId, generate = generateWithStoredSettings }) {
     if (characterId !== undefined && !validFileStem(characterId)) {
         throw new CharacterChatError(400, 'character_id must be a character filename without .png.');
     }
@@ -300,6 +342,9 @@ export async function sendCharacterMessage({ directories, handle, characterId, a
     if (!validFileStem(chatId)) throw new CharacterChatError(400, 'chat_id must be a valid chat filename without .jsonl.');
     if (typeof message !== 'string' || !message.trim()) throw new CharacterChatError(400, 'message must be a non-empty string.');
     if (message.length > 100_000) throw new CharacterChatError(413, 'message is too long.');
+    if (requestId !== undefined && (typeof requestId !== 'string' || !requestId.trim() || requestId.length > 200)) {
+        throw new CharacterChatError(400, 'request_id must contain 1–200 characters.');
+    }
 
     const characterPath = path.join(directories.characters, avatarUrl);
     if (!fs.existsSync(characterPath)) throw new CharacterChatError(404, 'Character not found.');
@@ -335,6 +380,18 @@ export async function sendCharacterMessage({ directories, handle, characterId, a
             }
         }
         if (!chatData.length || !chatData[0]?.chat_metadata) throw new CharacterChatError(422, 'Chat file is invalid.');
+        if (chatData.length === 1 && character.first_mes) {
+            chatData.push({ name: character.name, is_user: false, is_system: false, send_date: now, mes: character.first_mes, extra: {} });
+        }
+        if (requestId) {
+            const previousIndex = chatData.findIndex(item => item.is_user && item.extra?.studio_request_id === requestId);
+            if (previousIndex >= 0) {
+                if (chatData[previousIndex].mes !== message) throw new CharacterChatError(409, 'request_id was already used with different text.');
+                const previousAnswer = chatData.slice(previousIndex + 1).find(item => !item.is_user && item.extra?.studio_request_id === requestId);
+                if (!previousAnswer) throw new CharacterChatError(409, 'request_id has an incomplete previous turn.');
+                return { chat_id: chatId, message: previousAnswer.mes };
+            }
+        }
         const messages = buildMessages({ character, chatData, message, settings, directories });
         const reply = await generate({ messages, settings, directories });
         if (typeof reply !== 'string' || !reply.trim()) throw new CharacterChatError(502, 'Model returned no assistant text.');
@@ -347,11 +404,38 @@ export async function sendCharacterMessage({ directories, handle, characterId, a
         assertUnchanged();
         chatData[0].chat_metadata.tainted = true;
         chatData.push(
-            { name: userName, is_user: true, is_system: false, send_date: now, mes: message, extra: {} },
-            { name: character.name, is_user: false, is_system: false, send_date: new Date().toISOString(), mes: reply, extra: {} },
+            { name: userName, is_user: true, is_system: false, send_date: now, mes: message, extra: requestId ? { studio_request_id: requestId } : {} },
+            { name: character.name, is_user: false, is_system: false, send_date: new Date().toISOString(), mes: reply, extra: requestId ? { studio_request_id: requestId } : {} },
         );
         fs.mkdirSync(chatDir, { recursive: true });
         await trySaveChat(chatData, chatFile, false, handle, path.parse(avatarUrl).name, directories.backups, assertUnchanged);
         return { chat_id: chatId, message: reply };
     });
+}
+
+/** Yield assistant deltas while the regular chat save completes independently of the consumer. */
+export async function* streamCharacterMessage({ generateStream, ...arguments_ }) {
+    const queue = [];
+    let wake;
+    let finished = false;
+    let failure;
+    let result;
+    let produced = false;
+    const notify = () => { wake?.(); wake = undefined; };
+    const push = delta => { queue.push(delta); produced = true; notify(); };
+    const job = sendCharacterMessage({ ...arguments_, generate: async payload => {
+        if (generateStream) {
+            let answer = '';
+            for await (const delta of generateStream(payload)) { answer += delta; push(delta); }
+            return answer;
+        }
+        return generateWithStoredSettings({ ...payload, onChunk: push });
+    } });
+    job.then(value => { result = value; finished = true; notify(); }, error => { failure = error; finished = true; notify(); });
+    while (!finished || queue.length) {
+        if (queue.length) yield queue.shift();
+        else await new Promise(resolve => { wake = resolve; });
+    }
+    if (failure) throw failure;
+    if (!produced) yield result.message;
 }
